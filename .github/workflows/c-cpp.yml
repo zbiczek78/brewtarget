@@ -1,0 +1,213 @@
+#-----------------------------------------------------------------------------------------------------------------------
+# .github/workflows/linux-ubuntu.yml is part of Brewtarget, and is copyright the following authors 2021-2025:
+#   • Artem Martynov <martynov-a@polyplastic.by>
+#   • Chris Speck <cgspeck@gmail.com>
+#   • Mattias Måhl <mattias@kejsarsten.com>
+#   • Matt Young <mfsy@yahoo.com>
+#   • Mik Firestone <mikfire@gmail.com>
+#
+# Brewtarget is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later
+# version.
+#
+# Brewtarget is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied
+# warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more
+# details.
+#
+# You should have received a copy of the GNU General Public License along with this program.  If not, see
+# <http://www.gnu.org/licenses/>.
+#-----------------------------------------------------------------------------------------------------------------------
+name: Linux
+
+on:
+  push:
+    branches:
+      - main
+      - "stable/**"
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: "0 2 * * *"
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        #
+        # See https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners#supported-runners-and-hardware-resources
+        # for info on runner images
+        #
+        # Usually "ubuntu-latest" is the most recent LTS version of Ubuntu, but there can be a bit of lag between a new
+        # LTS release and the update of ubuntu-latest (eg in October 2022, it was still Ubuntu 20.04 rather than 22.04).
+        # So we explicitly specify here which versions we want to build on.
+        #
+        os: [ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      #
+      # See https://github.com/Brewtarget/brewtarget/wiki/Development:-Getting-Started for more on what is needed to build
+      # the software.  Most of this is now automated in 'bt setup all'.
+      #
+      # Some of the things that the bt script installs could be installed via actions (eg jurplel/install-qt-action@v3)
+      # and some are already installed by default for GitHub actions (eg cmake, git, debhelper, rpm) but there's an
+      # advantage, where we can, in doing the exact same steps that give as instructions to developers to set up their
+      # build environment.
+      #
+      # Of course, since 'bt' is a Python script, it can't install Python, so we need to do that first.  We need Python
+      # 3.10 or newer, which means you can't just use `sudo apt install` on older Ubuntus.  (Eg Ubuntu 18.04 packages
+      # have only Python 3.6.7 and Ubuntu 20.04 only have Python 3.8.2.  However Ubuntu 22.04 has Python 3.10.6.)  There
+      # are ways to get around this, but, in this context, it's simplest to use a canned GitHub action.
+      #
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install Frameworks and Libraries, and set up Meson build environment
+        working-directory: ${{github.workspace}}
+        shell: bash
+        run: |
+          pwd
+          ./bt -v setup all
+
+      - name: Create CMake build environment
+        run: cmake -E make_directory ${{github.workspace}}/build
+
+      - name: Configure CMake
+        shell: bash
+        working-directory: ${{github.workspace}}/build
+        run: |
+          umask 022
+          cmake \
+            DESTDIR=/usr \
+            -DDO_RELEASE_BUILD=ON \
+            -DNO_MESSING_WITH_FLAGS=ON \
+            $GITHUB_WORKSPACE
+
+      - name: Build (with Meson)
+        id: meson-build
+        working-directory: ${{github.workspace}}/mbuild
+        shell: bash
+        run: |
+          pwd
+          meson compile
+
+      # The 'export QT_DEBUG_PLUGINS=1' give us diagnostics in the event that there are problems initialising QT
+      # The 'export QT_QPA_PLATFORM=offscreen' stops Qt's xcb sub-module trying to connect to a non-existent display
+      # (which would cause the test runner to abort before running any tests).
+      - name: Test (via Meson)
+        id: meson-test
+        working-directory: ${{github.workspace}}/mbuild
+        shell: bash
+        run: |
+          export QT_DEBUG_PLUGINS=1
+          export QT_QPA_PLATFORM=offscreen
+          meson test
+
+      - name: Build (with CMake)
+        id: cmake-build
+        working-directory: ${{github.workspace}}/build
+        shell: bash
+        run: |
+          make
+
+      - name: Test (via CMake)
+        id: cmake-test
+        working-directory: ${{github.workspace}}/build
+        shell: bash
+        env:
+          CTEST_OUTPUT_ON_FAILURE: TRUE
+          QT_QPA_PLATFORM: minimal
+        run: |
+          make test
+
+      #
+      # Note that, although we continue to support CMake for local builds and installs, we no longer support packaging
+      # with CPack/CMake.  The bt build script packaging gives us better control over the packaging process.
+      #
+      # I did also have the idea of doing a subsequent step to try installing the package (eg via
+      # `sudo apt -f install ./brew*.deb`) but, in practice this gives errors about the following packages not being
+      # installable:
+      #    libqt6core6t64
+      #    libqt6gui6t64
+      #    libqt6network6t64
+      #    libqt6printsupport6t64
+      #    libqt6sql6t64
+      #    libqt6widgets6t64
+      #    libxalan-c112t64
+      #    libxerces-c3.2t64
+      #
+      # I suspect this is because there are restrictions on what you can install on GitHub action runners - presumably
+      # because they want you to not to do things other than builds with them.
+      #
+      - name: Package
+        working-directory: ${{github.workspace}}/mbuild
+        shell: bash
+        run: |
+          umask 022
+          ../bt package
+
+      - name: AppImage
+        working-directory: ${{github.workspace}}/mbuild
+        shell: bash
+        run: |
+          umask 022
+          ../bt appimage
+
+      #
+      # Can't get this working for the moment on Brewtarget and GitHub Action won't show me enough of the logs to see
+      # the error.  Seems to be working on Brewken though, so hopefully is fixable!
+      #
+#      - name: Flatpak
+#        working-directory: ${{github.workspace}}/mbuild
+#        shell: bash
+#        run: |
+#          umask 022
+#          ../bt flatpak
+
+      - name: Upload Linux Packages (Installers)
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: brewtarget-${{matrix.os}}
+          path: |
+            mbuild/packages/source/brewtarget*.tar.xz
+            mbuild/packages/source/brewtarget*.tar.xz.sha256sum
+            mbuild/packages/linux/brewtarget*.deb
+            mbuild/packages/linux/brewtarget*.deb.sha256sum
+            mbuild/packages/linux/brewtarget*.rpm
+            mbuild/packages/linux/brewtarget*.rpm.sha256sum
+            contAppPkgs/appimage/brewtarget*.AppImage
+            contAppPkgs/appimage/brewtarget*.AppImage.sha256sum
+            contAppPkgs/flatpak/brewtarget*.flatpak
+            contAppPkgs/flatpak/brewtarget*.flatpak.sha256sum
+          retention-days: 7
+
+      - name: Recover Debris Artifacts (Meson)
+        if: ${{ failure() && (steps.meson-build.conclusion == 'failure' || steps.meson-test.conclusion == 'failure') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mbuild-results-${{matrix.os}}
+          path: mbuild
+          retention-days: 1
+
+      - name: Recover Debris Artifacts (CMake)
+        if: ${{ failure() && (steps.cmake-build.conclusion == 'failure' || steps.cmake-test.conclusion == 'failure') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-results-${{matrix.os}}
+          path: build
+          retention-days: 1
+
+      # Meson test doesn't show log output on the terminal, but puts it straight to a log file.  We don't want to have
+      # to download the whole compressed mbuild tree just to see the log in event of a test failure, so we show it here
+      # (provided it exists).
+      - name: Show Meson test logs
+        if: ${{ failure() }}
+        working-directory: ${{github.workspace}}
+        shell: bash
+        run: |
+          if [[ -f mbuild/meson-logs/testlog.txt ]]; then cat mbuild/meson-logs/testlog.txt; fi
